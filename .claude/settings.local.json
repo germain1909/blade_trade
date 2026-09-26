@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:gateway.docs.projectx.com)",
+      "Bash(python3 -m py_compile trading_agent/config.py trading_agent/projectx_client.py trading_agent/data_downloader.py trading_agent/storage.py trading_agent/main.py)"
+    ]
+  }
+}
