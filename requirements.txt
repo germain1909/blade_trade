@@ -3,6 +3,7 @@ python-dotenv>=1.0.1
 pandas>=2.2.0
 openpyxl>=3.1.0
 slack_sdk>=3.27.0
+openai>=1.40.0   # HTTP client only — used against LM Studio's local OpenAI-compatible endpoint
 
 # Uncomment when implementing live SignalR streaming:
 # signalrcore>=0.9.5

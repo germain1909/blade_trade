@@ -1,0 +1,52 @@
+/Users/germainmac/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/germainmac/Library/Python/3.9/lib/python/site-packages/langgraph/checkpoint/base/__init__.py:18: LangChainPendingDeprecationWarning: The default value of `allowed_objects` will change in a future version. Pass an explicit value (e.g., allowed_objects='messages' or allowed_objects='core') to suppress this warning.
+  from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+==========================================================================================
+QuantHarness local-LLM smoke test -- integration/latency only, not a backtest
+==========================================================================================
+
+Step 1: verify LM Studio is reachable with the existing configuration...
+LM Studio reachable at http://127.0.0.1:1234/v1. Loaded models: ['qwen/qwen3-vl-4b', 'text-embedding-nomic-embed-text-v1.5']
+
+Step 2: fetch a minimal-but-sufficient data window (4 calendar days of 1h NQ bars --
+empirically confirmed to yield ~48 bars, clearing web_interface.py's hardcoded
+`df.tail(45)` floor; 3 days only yielded 25 bars due to the weekend gap)...
+  fetched 48 raw 1h bars (2026-09-24 13:56:12.353398 to 2026-09-28 13:56:12.353398)
+
+Step 3: run the SAME, unmodified QuantHarness analysis pipeline (web_interface.analyzer.run_analysis)...
+
+DataFrame columns: Index(['Datetime', 'Close', 'High', 'Low', 'Open', 'Volume'], dtype='object')
+DataFrame index: <class 'pandas.core.indexes.range.RangeIndex'>
+DataFrame shape: (48, 6)
+Slice columns: Index(['Datetime', 'Close', 'High', 'Low', 'Open', 'Volume'], dtype='object')
+Slice index: <class 'pandas.core.indexes.range.RangeIndex'>
+Dictionary keys: ['Datetime', 'Open', 'High', 'Low', 'Close']
+Dictionary key types: [<class 'str'>, <class 'str'>, <class 'str'>, <class 'str'>, <class 'str'>]
+  [call  1] agent=indicator_agent  text    159.04s  OK
+  [call  2] agent=indicator_agent  text    116.59s  OK
+Using precomputed pattern image from state
+  [call  3] agent=pattern_agent    VISION   44.11s  OK
+Using precomputed trend image from state
+  [call  4] agent=trend_agent      VISION   36.55s  OK
+  [call  5] agent=decision_agent   text     19.71s  OK
+
+==========================================================================================
+TOTAL run_analysis time: 376.97s   (5 LLM calls)
+==========================================================================================
+
+Per-agent totals:
+  indicator_agent  calls=2   total= 275.63s  failures=0
+  pattern_agent    calls=1   total=  44.11s  failures=0
+  trend_agent      calls=1   total=  36.55s  failures=0
+  decision_agent   calls=1   total=  19.71s  failures=0
+
+Final analysis result (success/error + top-level keys):
+  success: True
+  success: True
+  final_state: {'kline_data': {'Datetime': ['2026-09-24 20:00:00', '2026-09-24 22:00:00', '2026-09-24 23:00:00', '2026-09-25 00:00:00', '2026-09-25 01:00:00', '2026-09-25 02:00:00', '2026-09-25 03:00:00', '2026-09-25 04:00:00', '2026-09-25 05:00:00', '2026-09-25 06:00:00', '2026-09-25 07:00:00', '2026-09-25 08:00:
+  asset_name: Nasdaq Futures
+  timeframe: 1hour
+  data_length: 45
+
+Full call log + results written to smoke_test_results.json

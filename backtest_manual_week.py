@@ -41,6 +41,8 @@ import pandas as pd
 
 from mtf_indicators import compute_mtf_features, tags_for_row
 from backtest_weekly_swing_fade import INSTRUMENT_SPECS
+from market_snapshot import MarketSnapshot, build_snapshot
+from decision_strategy import Decision, Outcome, RuleBasedStrategy, Strategy
 
 ET = ZoneInfo("America/New_York")
 
@@ -62,6 +64,7 @@ class Config:
     max_risk_usd:         float = 500.0
     trade_start_et:       dtime = dtime(0, 0)
     trade_end_et:         dtime = dtime(23, 59)
+    symbol_label:         str   = "UNKNOWN"  # for MarketSnapshot.symbol / experiment records
 
 
 @dataclass
@@ -95,6 +98,8 @@ class Trade:
     pnl_usd:     float
     pnl_r:       float
     tags:        list[str] = field(default_factory=list)
+    mfe:         float = 0.0   # max favorable excursion in points, tracked from entry to exit
+    mae:         float = 0.0   # max adverse excursion in points
 
 
 class LevelWatcher:
@@ -131,8 +136,58 @@ def _level_line(name: str, w: "LevelWatcher", price: float, tick: float) -> str:
             f"IF it breaks through we'd go {cross_dir}{macd_str}")
 
 
-def run_week(week_bars: pd.DataFrame, features: pd.DataFrame,
-             levels: list[Level], cfg: Config) -> tuple[list[Trade], list[Snapshot]]:
+def _simulate_forward(
+    bars_list: list, start_idx: int, direction: str,
+    entry_px: float, stop_px: float, target_px: float,
+) -> tuple[datetime, float, str, float, float]:
+    """Walk bars_list[start_idx+1:] to find where this trade would have
+    exited had it been taken, plus max favorable/adverse excursion (points)
+    along the way. Used both to score SKIPped candidates ("what would have
+    happened anyway") and could equally re-derive a TAKEn trade's exit —
+    the exit rule here (stop wins on same-bar collision) matches the live
+    position-tracking loop in run_week() exactly.
+
+    Falls back to the last available bar's close ("session_end") if neither
+    level is hit before the data runs out.
+    """
+    mfe = 0.0
+    mae = 0.0
+    for row in bars_list[start_idx + 1:]:
+        if direction == "long":
+            mfe = max(mfe, row.high - entry_px)
+            mae = max(mae, entry_px - row.low)
+            hit_tp = row.high >= target_px
+            hit_sl = row.low <= stop_px
+        else:
+            mfe = max(mfe, entry_px - row.low)
+            mae = max(mae, row.high - entry_px)
+            hit_tp = row.low <= target_px
+            hit_sl = row.high >= stop_px
+        if hit_tp or hit_sl:
+            exit_px, reason = (stop_px, "stop") if hit_sl else (target_px, "target")
+            return row.timestamp, exit_px, reason, mfe, mae
+
+    last = bars_list[-1]
+    return last.timestamp, last.close, "session_end", mfe, mae
+
+
+def run_week(
+    week_bars: pd.DataFrame, features: pd.DataFrame,
+    levels: list[Level], cfg: Config,
+    strategy: Optional[Strategy] = None,
+) -> tuple[list[Trade], list[Snapshot], list[tuple[MarketSnapshot, Decision, Outcome]]]:
+    """
+    strategy: judges each cross/fail candidate as TAKE or SKIP. Defaults to
+    RuleBasedStrategy(require_macd_turn=cfg.require_macd_turn) — the original
+    boolean MACD gate — so callers that don't pass a strategy get exactly the
+    same behavior as before this parameter existed. Pass an LLMStrategy to
+    run the same candidate stream through a local LLM instead (see
+    run_experiment.py) — every SKIPped candidate still gets a forward-simulated
+    hypothetical outcome so both experiments are comparable.
+    """
+    if strategy is None:
+        strategy = RuleBasedStrategy(require_macd_turn=cfg.require_macd_turn)
+
     tick = cfg.tick_size
     approach_dist = cfg.approach_ticks * tick
     fail_dist     = cfg.fail_confirm_ticks * tick
@@ -140,9 +195,13 @@ def run_week(week_bars: pd.DataFrame, features: pd.DataFrame,
     sbuf          = cfg.stop_buffer_ticks * tick
     max_stop_pts  = cfg.max_risk_usd / (cfg.dollars_per_point * cfg.contracts)
 
+    levels_map = {lv.name: lv.price for lv in levels}
     watchers = {lv.name: LevelWatcher(lv) for lv in levels}
     trades: list[Trade] = []
     snapshots: list[Snapshot] = []
+    decisions: list[tuple[MarketSnapshot, Decision, Outcome]] = []
+
+    bars_list = list(week_bars.itertuples())
 
     in_trade = False
     trade_dir = ""
@@ -151,13 +210,22 @@ def run_week(week_bars: pd.DataFrame, features: pd.DataFrame,
     active_level: Optional[Level] = None
     active_setup = ""
     active_tags: list[str] = []
+    cur_mfe = 0.0
+    cur_mae = 0.0
 
-    for row in week_bars.itertuples():
+    for idx, row in enumerate(bars_list):
         ts_et = row.timestamp.astimezone(ET)
         bar_time = ts_et.time()
 
         # ── Manage open trade ────────────────────────────────────────
         if in_trade:
+            if trade_dir == "long":
+                cur_mfe = max(cur_mfe, row.high - entry_px)
+                cur_mae = max(cur_mae, entry_px - row.low)
+            else:
+                cur_mfe = max(cur_mfe, entry_px - row.low)
+                cur_mae = max(cur_mae, row.high - entry_px)
+
             risk = abs(entry_px - stop_px)
             hit_tp = (row.high >= target_px) if trade_dir == "long" else (row.low <= target_px)
             hit_sl = (row.low <= stop_px)     if trade_dir == "long" else (row.high >= stop_px)
@@ -171,6 +239,7 @@ def run_week(week_bars: pd.DataFrame, features: pd.DataFrame,
                     direction=trade_dir, entry_time=entry_time, entry_px=entry_px,
                     stop_px=stop_px, target_px=target_px, exit_time=row.timestamp,
                     exit_px=ep, exit_reason=reason, pnl_usd=pnl, pnl_r=r, tags=active_tags,
+                    mfe=cur_mfe, mae=cur_mae,
                 ))
                 in_trade = False
                 watchers[active_level.name].cooldown_until = \
@@ -230,12 +299,9 @@ def run_week(week_bars: pd.DataFrame, features: pd.DataFrame,
             direction = ("short" if w.side == "above" else "long") if crossed \
                         else ("long" if w.side == "above" else "short")
 
-            if cfg.require_macd_turn:
-                turn_col = "15m_macd_bottom_recent" if direction == "long" else "15m_macd_top_recent"
-                macd_ok = bool(feat_row is not None and feat_row.get(turn_col))
-                if not macd_ok:
-                    continue
-
+            # Bracket math is computed up front regardless of TAKE/SKIP — a SKIPped
+            # candidate still needs an entry/stop/target to score "what would have
+            # happened anyway" against.
             if direction == "long":
                 ep = row.close + tick * cfg.slippage_ticks
                 stp = (w.level.price - sbuf) if setup == "cross" else (w.extreme - sbuf)
@@ -248,17 +314,56 @@ def run_week(week_bars: pd.DataFrame, features: pd.DataFrame,
                 stp = min(stp, ep + max_stop_pts)
 
             risk = abs(ep - stp)
-            if risk > 0:
+            if risk <= 0:
+                w.state = "NOT_NEAR"
+                continue
+
+            tgt = ep + risk * cfg.target_r_multiple if direction == "long" \
+                  else ep - risk * cfg.target_r_multiple
+            cand_tags = tags_for_row(features.loc[row.timestamp]) if row.timestamp in features.index else []
+
+            snapshot = build_snapshot(
+                timestamp=row.timestamp, symbol=cfg.symbol_label, price=row.close,
+                bars_df=week_bars, feat_row=feat_row, levels=levels_map,
+                level_name=w.level.name, setup_type=setup, setup_direction=direction,
+                tags=tuple(cand_tags),
+            )
+            decision = strategy.decide(snapshot)
+
+            # Forward-simulate the outcome regardless of TAKE/SKIP — for TAKE this
+            # mirrors exactly what the live "Manage open trade" loop above will
+            # independently compute for the real Trade record (same bracket, same
+            # stop-wins-on-collision rule), just used here for the decisions log;
+            # for SKIP it's the only record of what would have happened.
+            exit_time, exit_px, exit_reason, mfe, mae = _simulate_forward(
+                bars_list, idx, direction, ep, stp, tgt,
+            )
+            pnl = ((exit_px - ep) if direction == "long" else (ep - exit_px)) \
+                  * cfg.dollars_per_point * cfg.contracts
+            pnl_r = ((exit_px - ep) if direction == "long" else (ep - exit_px)) / risk if risk else 0.0
+            outcome = Outcome(
+                entry_px=ep, stop_px=stp, target_px=tgt,
+                exit_time=exit_time, exit_px=exit_px, exit_reason=exit_reason,
+                pnl_usd=round(pnl, 2), pnl_r=round(pnl_r, 2),
+                mfe=round(mfe, 4), mae=round(mae, 4),
+                outcome_type="actual" if decision.action == "TAKE" else "hypothetical",
+            )
+            decisions.append((snapshot, decision, outcome))
+
+            if decision.action == "TAKE":
                 in_trade = True
                 trade_dir = direction
-                entry_px, stop_px = ep, stp
-                target_px = ep + risk * cfg.target_r_multiple if direction == "long" \
-                            else ep - risk * cfg.target_r_multiple
+                entry_px, stop_px, target_px = ep, stp, tgt
                 entry_time = row.timestamp
                 active_level = w.level
                 active_setup = setup
-                active_tags = tags_for_row(features.loc[row.timestamp]) if row.timestamp in features.index else []
-            w.state = "NOT_NEAR"
+                active_tags = cand_tags
+                cur_mfe = 0.0
+                cur_mae = 0.0
+                w.state = "NOT_NEAR"
+            # else: SKIP — leave the watcher APPROACHING so it re-checks next bar,
+            # matching the original inline-continue behavior of the boolean MACD
+            # gate exactly (a SKIP doesn't retire the level).
 
         # ── 15-minute plan snapshot ──────────────────────────────────
         if row.timestamp.minute % 15 == 0:
@@ -275,7 +380,7 @@ def run_week(week_bars: pd.DataFrame, features: pd.DataFrame,
                 level_lines=level_lines, tags=tags,
             ))
 
-    return trades, snapshots
+    return trades, snapshots, decisions
 
 
 def print_plan(snapshots: list[Snapshot], symbol: str) -> None:
@@ -382,7 +487,7 @@ def main() -> None:
     spec = INSTRUMENT_SPECS.get(args.symbol.upper(), INSTRUMENT_SPECS["NQ"])
     cfg = Config(contracts=args.contracts, tick_size=spec["tick_size"],
                  dollars_per_point=spec["dollars_per_point"], cooldown_hours=args.cooldown_hours,
-                 require_macd_turn=not args.no_macd_turn)
+                 require_macd_turn=not args.no_macd_turn, symbol_label=args.symbol.upper())
     levels = [parse_level(s) for s in args.levels]
 
     print(f"Loading {path} ...")
@@ -409,7 +514,7 @@ def main() -> None:
     print(f"Week bars: {len(week_bars):,}  ({week_bars['timestamp'].iloc[0]} -> {week_bars['timestamp'].iloc[-1]})")
     print(f"Levels: {', '.join(f'{l.name}={l.price:.2f}' for l in levels)}")
 
-    trades, snapshots = run_week(week_bars, features, levels, cfg)
+    trades, snapshots, decisions = run_week(week_bars, features, levels, cfg)
     if args.plan:
         print_plan(snapshots, args.symbol.upper())
     print_journal(trades, args.symbol.upper())
